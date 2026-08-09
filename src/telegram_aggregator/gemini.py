@@ -123,29 +123,46 @@ class GeminiAnalyzer:
             )
 
         last_error: Exception | None = None
-        for model_name in self._available_models():
-            try:
-                response = self._client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        response_mime_type="application/json",
-                        response_json_schema=ListingExtraction.model_json_schema(),
-                    ),
-                )
-                extraction = ListingExtraction.model_validate_json(response.text)
-                self._model = model_name
-                return extraction
-            except Exception as exc:
-                status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-                logging.warning("Gemini model %s failed (status=%s): %s — trying next model", model_name, status_code, exc)
-                last_error = exc
-                continue
+        max_passes = 3  # сколько раз обойти весь список моделей заново
+
+        for attempt in range(1, max_passes + 1):
+            models_to_try = self._available_models()
+            if not models_to_try:
+                logging.error("No Gemini models left to try (all permanently blocked)")
+                break
+
+            for model_name in models_to_try:
+                try:
+                    response = self._client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            response_mime_type="application/json",
+                            response_json_schema=ListingExtraction.model_json_schema(),
+                        ),
+                    )
+                    extraction = ListingExtraction.model_validate_json(response.text)
+                    self._model = model_name
+                    return extraction
+                except Exception as exc:
+                    permanently_blocked, retry_delay = self._parse_quota_error(exc)
+                    if permanently_blocked:
+                        logging.warning("Gemini model %s has zero quota on this plan — excluding permanently", model_name)
+                        self._blocked_models.add(model_name)
+                    elif retry_delay is not None and retry_delay <= _MAX_RETRY_WAIT_SECONDS:
+                        logging.warning("Gemini model %s rate-limited, waiting %.1fs before trying next model", model_name, retry_delay)
+                        time.sleep(retry_delay)
+                    else:
+                        logging.warning("Gemini model %s failed: %s — trying next model", model_name, exc)
+                    last_error = exc
+                    continue
+
+            logging.warning("Pass %d/%d through all models failed, retrying full cycle", attempt, max_passes)
 
         if last_error is not None:
             raise last_error
-        raise RuntimeError("Gemini returned no usable models")
+        raise RuntimeError("Gemini returned no usable models (all blocked or failed)")
 
 
 def guess_mime_type(path: str) -> str:
