@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import mimetypes
 
@@ -7,6 +8,18 @@ from google import genai
 from google.genai import types
 
 from .models import ListingExtraction, SourceMedia
+
+# Используется только если GEMINI_MODEL=auto (или не задан) И сам вызов
+# ListModels (автообнаружение) упал — например, сетевая проблема или права
+# ключа. Порядок примерно от дешёвой/быстрой к более мощной модели.
+_DEFAULT_MODEL_FALLBACKS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.5-pro",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+]
 
 
 SYSTEM_PROMPT = """Ты — классификатор и редактор объявлений для европейской Telegram-барахолки.
@@ -73,6 +86,7 @@ class GeminiAnalyzer:
                 if name:
                     discovered.append(name)
         except Exception:
+            logging.warning("Gemini model discovery (ListModels) failed; falling back to static model list", exc_info=True)
             discovered = []
 
         ordered: list[str] = []
@@ -88,8 +102,12 @@ class GeminiAnalyzer:
             seen.add(candidate)
             ordered.append(candidate)
 
-        if not ordered and self._model:
-            ordered = [self._normalize_model_name(self._model)]
+        if not ordered:
+            if self._model and self._normalize_model_name(self._model) != "auto":
+                ordered = [self._normalize_model_name(self._model)]
+            else:
+                ordered = list(_DEFAULT_MODEL_FALLBACKS)
+                logging.info("Using static fallback model list: %s", ordered)
 
         self._candidate_models = ordered
         return ordered
@@ -120,6 +138,8 @@ class GeminiAnalyzer:
                 self._model = model_name
                 return extraction
             except Exception as exc:
+                status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+                logging.warning("Gemini model %s failed (status=%s): %s — trying next model", model_name, status_code, exc)
                 last_error = exc
                 continue
 
